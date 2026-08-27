@@ -1,1 +1,6 @@
+Note to self -- determine which scripts are written in python2 and python3 and bash
 
+- add in a workflow of what commands to type 
+- there are some bash scripts that need adjusting so manual editing is unnecessary 
+- need to document the multiple things that can be done (2Dscan, focus runs, IV testing, and TCT
+    measurement -- also need to document the multi-channel options (2Dscan and TCT)
