@@ -1,0 +1,133 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+
+
+import os
+import argparse
+import time
+import datetime
+from OOHw.interface.InterfaceFactory import InterfaceFactory
+from OOHw.files.BINWriter import BINWriter
+import powerSupply as pW
+import vxi11
+
+def safeObtainPreamble( scope, channel, retries = 20, delay = .5 ):
+    for attempt in range( retries ):
+        try:
+            return scope.obtainPreamble( channel )
+        except ( KeyError, vxi11.vxi11.Vxi11Exception ) as e:
+            if attempt == retries - 1:
+                raise
+            print "safeObtainPreamble retry %d/%d after %s" % ( attempt + 1, retries, e )
+            time.sleep( delay )
+
+def channelFilename( filename, channel, multi ):
+    if not multi:
+        return filename
+    chNum = "".join( c for c in channel if c.isdigit() )
+    return filename.replace( ".bin", "_ch%s.bin" % chNum )
+
+def acquireData( scope, numAcquisitions, filename, channels, averageNumber ):
+    multi = len( channels ) > 1
+    writers = {}
+    for channel in channels:
+        writers[ channel ] = BINWriter( channelFilename( filename, channel, multi ) )
+    for i in range( 1, numAcquisitions + 1 ):
+        scope.clearSweeps()
+        while safeObtainPreamble( scope, channels[ 0 ] )[ "SWEEPS_PER_ACQ" ] != str( averageNumber ):
+            print "Sweeps: %s/%s" % ( safeObtainPreamble( scope, channels[ 0 ] )[ "SWEEPS_PER_ACQ" ], averageNumber )
+            time.sleep( .5 )
+        for channel in channels:
+            waveform, points, bytesPoint = scope.readWaveformBIN( channel )
+            binwriter = writers[ channel ]
+            if i == 1:
+                binwriter.header = scope.preamble
+                binwriter.bytesPerPoint( bytesPoint )
+                binwriter.pointsPerMeasurement( points )
+            binwriter.addData( waveform )
+    for binwriter in writers.values():
+        binwriter.writeData()
+        binwriter.close()
+
+def confScope( scope, channels ):
+    for channel in channels:
+        scope.channel = "C" + str( channel )
+        scope.function = "F" + str( channel )
+        scope.coupling( scope.channel, "D50" )
+        scope.trace( scope.channel, "ON" )
+        scope.trace( scope.function, "ON" )
+
+def setAverage( scope, channels, average_number ):
+    for channel in channels:
+        scope.channel = "C" + str( channel )
+        scope.function = "F" + str( channel )
+        scope.average( average_number )
+
+def parseador():  # To convert the timestamp to a normal date time: datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+  parser = argparse.ArgumentParser( description = "TCT acquisition program with Lecroy Lc725Zi" )
+  parser.add_argument( "-a", "--acquisition_mode", type = str, choices = [ "single", "average" ], default = "sample", help = "acquisition mode. Choices = single, average. Default = %(default)s", metavar = "" )
+  parser.add_argument( "-n", "--acquisition_number", type = int, help = "number of acquisitions for TCT. Default = 512. For average mode, default = 1", metavar = "" )
+  parser.add_argument( "-g", "--average_number", type = str, default = "512", help = " number of waves to average when average acquisition is chosen. Default = %(default)s", metavar = "" )
+  parser.add_argument( "-c", "--channel", type = str, default = "4", help = "acquisition channel(s). For multi-channel acquisition, pass a comma-separated list, e.g. '1,4'. Default = %(default)s", metavar = "" )
+  parser.add_argument( "-v", "--voltage", type = str, default = "0", help = "bias voltage applied to the sensor in V. Default = %(default)sV", metavar = ""  )
+  parser.add_argument( "-m", "--compliance", type = float, default = "10e-6", help = "compliance high voltage power supply. Default = %(default)sA", metavar = "" )
+#  parser.add_argument( "-l", "--amp_voltage", type = str, default = "8", help = "bias voltage for the amplifier in V. Default = %(default)sV", metavar = ""  )
+#  parser.add_argument( "-p", "--amp_compliance", type = float, default = "300e-3", help = "compliance for the amplifier power supply. Default = %(default)sA", metavar = "" )
+  parser.add_argument( "-b", "--bulk", type = str, choices = [ "p", "n" ], help = "bulk of the sensor. Choices = n, p", metavar = "" )
+  parser.add_argument( "-i", "--intensity", type = str, default = "0", help = "laser intensity in %%. Default = %(default)s", metavar = "" )
+  parser.add_argument( "-t", "--temperature", type = str, default = "32", help = "acquisition temperature in F. Default = %(default)s ", metavar = ""  )
+  parser.add_argument( "-f", "--filename", type = str, default = "TCT_Voltage_Temp_Int_" + datetime.datetime.fromtimestamp( time.time() ).strftime( '%Y-%m-%d_%H:%M' ) + ".bin", help = "binary file name. Default = %(default)s", metavar = "" )
+  parser.add_argument( "-x", "--no_turn_off", action='store_true', help = "do not turn off the power supply at the end." )
+  parser.add_argument( "-y", "--no_turn_on", action='store_true', help = "do not control the HV power supply." )
+  parser.add_argument( "-z", "--turn_off", action='store_true', help = "turn off both power supply and exit." )
+  args = parser.parse_args()
+  if ".bin" not in args.filename:
+    args.filename = args.filename + ".bin"
+  if "_Voltage_Temp" not in args.filename:
+    args.filename = args.filename.replace( ".bin", "_Voltage_Temp_Int" + datetime.datetime.fromtimestamp( time.time() ).strftime('_%Y-%m-%d_%H:%M:%S') + ".bin" )
+  if "Voltage" in args.filename:
+    args.filename = args.filename.replace( "Voltage", "V" + args.voltage + "V" )
+    args.filename = args.filename.replace( "Temp", "T" + args.temperature + "F" )
+    args.filename = args.filename.replace( "Int", "I" + args.intensity )
+  if args.voltage and not args.bulk and not args.turn_off:
+    parser.error( "--voltage requires --bulk" )
+  if float( args.voltage  ) > 0 and args.bulk == "n":
+    parser.error( "n bulk requires negative voltage" )
+  if float( args.voltage  ) < 0 and args.bulk == "p":
+    parser.error( "p bulk requires positive voltage" )
+  if args.acquisition_number is None:
+    if args.acquisition_mode == "average":
+      args.acquisition_number = 1
+    else:
+      args.acquisition_number = 512
+  args.channels = [ int( ch.strip() ) for ch in args.channel.split( "," ) if ch.strip() != "" ]
+  return args
+
+def main():
+  t1 = time.time()
+  args = parseador()
+  factory = InterfaceFactory( "setupBrown.ini" )
+  scope = factory.getDevice( "scope" )
+  keithley = factory.getDevice( "highVoltage" )
+  if args.turn_off:
+    pW.turnOFFPowerSupply( keithley )
+    return
+  if not args.no_turn_on:
+    pW.setPowerSupply( keithley, args.voltage, args.compliance )
+#  scope.controlAcquisition( "STOP" )
+  confScope( scope, args.channels )
+  if args.acquisition_mode == "average":
+    setAverage( scope, args.channels, args.average_number )
+    scope.controlAcquisition( "AUTO" )
+    channels = [ "F" + str( ch ) for ch in args.channels ]
+  else:
+    scope.controlAcquisition( "SINGLE" )
+    channels = [ "C" + str( ch ) for ch in args.channels ] 
+  acquireData( scope, args.acquisition_number, os.path.join( os.getcwdu(), args.filename ), channels, args.average_number )
+  if not args.no_turn_off:
+    pW.turnOFFPowerSupply( keithley )
+  print time.time() - t1
+
+
+if __name__ == "__main__":
+  main()

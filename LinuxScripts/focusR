@@ -1,0 +1,347 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+
+import os
+import os.path
+import argparse
+import shutil
+import time
+import numpy as np
+from OOHw.interface.InterfaceFactory import InterfaceFactory
+from OOHw.files.BINWriter import BINWriter
+import matplotlib
+matplotlib.use( "Agg" )
+import pylab
+from scipy import optimize
+import scipy.special as sp
+import analyzeData as aD
+from TCTData import TCTData
+import powerSupply as pW
+import coordinatesFile as cF
+import stages
+import vxi11
+
+
+def confScope( scope, channel ):
+  scope.channel = "C" + str( channel )
+  scope.function = "F" + str( channel )
+  scope.coupling( scope.channel, "D50" )
+  scope.trace( scope.channel, "ON" )
+  scope.trace( scope.function, "ON" )
+
+def writeNewCoord( newCoordinate, detector, ax ):
+  axis = [ "x", "y", "z" ]
+  sensors = cF.getCoordFromFile()
+  newCoord = sensors[ detector ]
+  newCoord[ axis.index( ax ) ] = newCoordinate
+  X, Y, Z = newCoord
+  if detector == "Ref":
+    cF.changeRelCoordRefDiode( X, Y, Z )
+    print "New Coord, sensor %s: %s %s %s" % ( detector, X, Y, Z )
+    return
+  sensors = cF.changeCoordinate( sensors, detector, X, Y, Z )
+  sensors = cF.setCoordHoldSyst( sensors )
+  cF.writeCoord2File( sensors )
+  print "New Coord, sensor %s: %s %s %s" % ( detector, X, Y, Z )
+
+def optimumCoordinate( p1, x, xx, y, ax ):
+  if ax == "z":
+    medio = y.index( min( y ) )
+    newCoordinate = x[ medio ]
+  else:
+    y = list( fitfunc( p1, xx ) )
+    indice1 = y.index( min( y ) )
+    y.reverse()
+    indice2 = len( y ) - y.index( min( y ) )
+    medio = indice1 + ( indice2 - indice1 ) / 2
+    y.reverse()
+    newCoordinate = xx[ medio ]
+  return newCoordinate, min( y )
+
+def safeObtainPreamble( scope, channel, retries = 20, delay = .5):
+    for attempt in range(retries):
+        try:
+            return scope.obtainPreamble(channel)
+        except ( KeyError, vxi11.vxi11.Vxi11Exception ) as e:
+            if attempt == retries - 1:
+                raise
+            print "safeObtainPreamble retry %d/%d after %s" % ( attempt + 1, retries, e )
+            time.sleep(delay)
+
+def acquireData( scope, numAcquisitions, averageNumber, filename, channel ):
+  binwriter = BINWriter( filename )
+  for i in range( 1, numAcquisitions + 1 ):
+    scope.clearSweeps()
+    while safeObtainPreamble( scope, channel )[ "SWEEPS_PER_ACQ" ] != str( averageNumber ):
+      print "Sweeps: %s/%s" % ( safeObtainPreamble( scope, channel )[ "SWEEPS_PER_ACQ" ], averageNumber )
+      time.sleep( .5 )
+    waveform, points, bytesPoint = scope.readWaveformBIN( channel )
+    print "DEBUG len(waveform)=%d points=%s bytesPoint=%s expected_len=%s" % ( len( waveform ), points, bytesPoint, points * bytesPoint if isinstance( points, int ) and isinstance( bytesPoint, int ) else "N/A" )
+    if i == 1:
+      binwriter.header = scope.preamble
+      binwriter.bytesPerPoint( bytesPoint )
+      binwriter.pointsPerMeasurement( points )
+    binwriter.addData( waveform )
+  binwriter.writeData()
+  binwriter.close()
+
+def getElectronicNoiseSignal( s, sensors, args, scope, ax, channel ):
+  coord = list( sensors[ args.subparser ] )
+  coord[ 1 ] += 5000
+  stages.sendtoCoordinates( s, coord )
+  acquireData( scope, 1, args.average_number, "electronicNoise_%s_%s.bin" % ( args.subparser, ax ), channel )
+  stages.sendtoCoordinates( s, sensors[ args.subparser ] )
+
+fitfunc = lambda p, x: p[ 0 ] * ( sp.erf( ( x - p[ 1 ] ) / p[ 3 ] ) + sp.erf( ( -x + p[ 2 ] ) / p[ 3 ] ) ) + p[ 4 ]  # Target function
+errfunc = lambda p, x, y: fitfunc( p, x ) - y  # Distance to the target function
+
+def fit( x, y, a, b, c, d, e ):
+  p0 = [ a, b, c, d, e ]  # Initial guess for the parameters
+  p1, success = optimize.leastsq( errfunc, p0[ : ], args = ( x[ : ], y[ : ] ) )
+  print("min(y) is : " + str(p1[0]))
+  #print("max(x) is : " + str(p1[1]))
+  #print("min(x) is : " + str(p1[2]))
+  print("FWHM is : " + str(p1[3]))
+  print("offset is : " + str(p1[4]))
+  return p1, success
+
+def findOptimumPosition( sensors, scope, args, ax, channel ):
+  xdata = []
+  ydata = []
+  xdata_double = []
+  ydata_double = []
+  fds = []
+  axes = [ "x", "y", "z" ]
+  if args.size in [ "Ref", "Small" ]:
+    # Small diodes measure 1.3mm wide. Reference 1.8mm wide.
+    #rangesteps = { "x" : [ -250, 250, 5 ], "y" : [ -250, 250, 5 ], "z" : [ -8000, 15000, 100 ] }
+    rangesteps = { "x" : [ -150, 150, 10 ], "y" : [ -150, 150, 10 ], "z" : [ -4000, 4000, 100 ] }
+  else:
+    # Big diodes measure 3mm wide.
+    rangesteps = { "x" : [ -5500, 5500, 100 ], "y" : [ -3500, 3500, 175 ], "z" : [ -13000, 4000, 300 ] }
+    #rangesteps = { "x" : [ -1000, 1000, 50 ], "y" : [ -1000, 1000, 50 ], "z" : [ -6500, 10000, 300 ] }
+  center = sensors[ args.subparser ]
+  rango = range( rangesteps[ ax ][ 0 ], rangesteps[ ax ][ 1 ], rangesteps[ ax ][ 2 ] )
+  s = stages.open_socket()
+  for i in rango:
+    print "\nAcquiring in axis %s: step %d of %d" % ( ax, rango.index( i ) + 1, len( rango ) )
+    coordinates = center[ : ]
+    coordinates[ axes.index( ax ) ] += i
+    cc = stages.sendtoCoordinates( s, coordinates )
+    if cc == [ "out", "out", "out" ]:
+     return cc
+    filename = "focus_%s_%s%s.bin" % ( args.subparser, ax, str( center[ axes.index( ax ) ] + i ) )
+    fds.append( filename )
+    acquireData( scope, args.acquisition_number, args.average_number, filename, channel )
+    ydata.append( processAndAnalysis( filename, args ) )
+    xdata.append( coordinates[ axes.index( ax ) ] )
+  stages.close_socket( s )
+  newCoordinate = plot( np.array( xdata ), np.array( ydata ), ax, "." )
+  return newCoordinate
+
+def doubleArray(xdata, ydata):
+  k = 0
+  xdata_double = []
+  ydata_double = []
+  while k < len(xdata):
+    if k == 0:
+      xdata_double.append(xdata[k])
+      ydata_double.append(ydata[k])
+    else:
+      xdata_double.append((xdata[k] + xdata[k - 1])/2)
+      xdata_double.append(xdata[k])
+      ydata_double.append((ydata[k] + ydata[k - 1])/2)
+      ydata_double.append(ydata[k])
+    k += 1
+  return xdata_double, ydata_double
+
+def processAndAnalysis( filename, args, cut = "signal" ):
+  noiseFile = "electronicNoise_%s_%s.bin" % ( args.subparser, filename.split( "_" )[ 2 ][ 0 ] )
+  noiseTCT = TCTData( noiseFile )
+  noiseTCT.bulk = args.bulk
+  dataTCT = TCTData( filename )
+  dataTCT.bulk = args.bulk
+  aD.getData( noiseTCT )
+  aD.getData( dataTCT )
+  aD.convertAndShiftData( noiseTCT )
+  aD.processData( dataTCT, noiseTCT, cut )
+  integral = sum( dataTCT.cuttedData ) * dataTCT.header[ "xincr" ]
+  print "File: %s\nIntegral: %e" % ( filename, integral )
+  return integral
+
+def plot( x, y, ax, dirname ):
+  aD.plot_parameters()
+  fig = pylab.figure( 1, ( 7, 6 ) )
+  fig.add_subplot( 111 )
+  pylab.plot( x, y, "ko", fillstyle = "none", label = ax + " Exp. data" )
+  xx = np.array( range( min( x ), max( x ) + 1 ) )
+#  p1, success = fit( x, y, min(y), max( x ), min( x ), (max(x) - min(x))/2, 1000 )
+  deriv = []
+  i = 0
+  deriv_max_pos = 0
+  deriv_max = 0
+  deriv_max_2 = 0
+  deriv_max_2_pos = 0
+  while i < len(y) - 1:
+    deriv.append(abs(y[i] - y[i + 1]))
+    i += 1
+  deriv_max = max(deriv)
+  deriv_max_pos = deriv.index(deriv_max)
+  deriv_2 = deriv[0:deriv_max_pos - 10]
+  k = 0
+  while k < len(deriv) - (deriv_max_pos + 10):
+    deriv_2.append(deriv[k + deriv_max_pos + 10])
+    k += 1
+  deriv_max_2 = max(deriv_2)
+  deriv_max_2_pos = deriv.index(deriv_max_2)
+  deriv_max_pos = x[deriv_max_pos]
+  deriv_max_2_pos = x[deriv_max_2_pos]
+  print("First drop is at: " + str(min(deriv_max_pos, deriv_max_2_pos)))
+  print("Second drop is at: " + str(max(deriv_max_pos, deriv_max_2_pos)))
+  p1, success = fit( x, y, min(y)/2, min(deriv_max_pos, deriv_max_2_pos), max(deriv_max_pos, deriv_max_2_pos), 30, -2e-11 )
+  print "FWHM:", round(p1[ 3 ] * 1.6617, 1), "um"
+  if ax != "z":
+    pylab.plot( xx, fitfunc( p1, xx ), "k-", label = "Erf fit" )
+  newCoordinate, integral = optimumCoordinate( p1, x, xx, list( y ), ax )
+  pylab.plot( newCoordinate, integral, "sk", fillstyle = "none", label = "New Focus" )
+  pylab.xlabel( "Laser Absolute Position (um)" )
+  pylab.ylabel( "Integral (a.u)" )
+  pylab.legend( loc = 0 )
+  pylab.grid( True )
+  pylab.tight_layout()
+  pylab.savefig( dirname + "/" + ax + "_" + args.subparser + ".png" )
+  pylab.close()
+  return newCoordinate
+
+def parseador():
+  parser = argparse.ArgumentParser( description = "Laser Focus program" )
+  subparser = parser.add_subparsers()
+  first = subparser.add_parser( "First", help = "Focus on the First diode" )
+  second = subparser.add_parser( "Second", help = "Focus on the Second diode" )
+  third = subparser.add_parser( "Third", help = "Focus on the Third diode" )
+  fourth = subparser.add_parser( "Fourth", help = "Focus on the Fourth diode" )
+  fifth = subparser.add_parser( "Fifth", help = "Focus on the Fifth diode" )
+  sixth = subparser.add_parser( "Sixth", help = "Focus on the Sixth diode" )
+  seventh = subparser.add_parser( "Seventh", help = "Focus on the Seventh diode" )
+  ref = subparser.add_parser( "Ref", help = "Focus on the Reference diode" )
+  first.set_defaults( subparser = "First" )
+  second.set_defaults( subparser = "Second" )
+  third.set_defaults( subparser = "Third" )
+  fourth.set_defaults( subparser = "Fourth" )
+  fifth.set_defaults( subparser = "Fifth" )
+  sixth.set_defaults( subparser = "Sixth" )
+  seventh.set_defaults( subparser = "Seventh" )
+  ref.set_defaults( subparser = "Ref" )
+  parser.add_argument( "-d", "--analyze_data", action = "store_true", help = "analyze data already taken from the chosen diode" )
+  parser.add_argument( "-f", "--files", nargs="+", help = "list of files to analyze", metavar = "" )
+  parser.add_argument( "-p", "--go_to_position", action = "store_true", help = "move the laser over the selected diode and exit" )
+  parser.add_argument( "-a", "--acquisition_mode", type = str, choices = [ "sample", "peakdetect", "average", "envelope" ], default = "sample", help = "acquisition mode. Choices = sample, peakdetect, average, envelope. Default = %(default)s", metavar = "" )
+  parser.add_argument( "-g", "--average_number", type = str, default = "100", help = "average number for average acquisition. Default = %(default)s", metavar = "" )
+  parser.add_argument( "-n", "--acquisition_number", type = int, default = 100, help = "number of acquisitions for the TCT. Default = %(default)s. For average mode, default = 1", metavar = "" )
+  parser.add_argument( "-c", "--channel", type = int, default = "1", help = "acquisition channel. Default = %(default)s", metavar = "" )
+  parser.add_argument( "-v", "--voltage", type = str, default = "0", help = "bias voltage applied to the sensor in V. Default = %(default)s", metavar = ""  )
+  parser.add_argument( "-m", "--compliance", type = float, default = "10e-6", help = "complienace. Default = %(default)s", metavar = "" )
+  parser.add_argument( "-l", "--amp_voltage", type = str, default = "8", help = "bias voltage for the amplifier in V. Default = %(default)sV", metavar = ""  )
+  parser.add_argument( "-j", "--amp_compliance", type = float, default = "300e-3", help = "compliance for the amplifier power supply. Default = %(default)sA", metavar = "" )
+  parser.add_argument( "-t", "--temperature", type = str, default = "32", help = "acquisition temperature in F. Default = %(default)s", metavar = ""  )
+  parser.add_argument( "-e", "--axis", type = list, default = "xyz", help = "focus the chosen axis. Default = [x,y,z]", metavar = "" )
+  parser.add_argument( "-s", "--size", type = str, default = "Ref", choices = [ "Small", "Big", "Ref" ], help = "type of size for number of steps. Sizes = Small, Big, Ref. Default = %(default)s", metavar = ""  )
+  parser.add_argument( "-b", "--bulk", type = str, choices = [ "p", "n" ], help = "bulk of the sensor. Choices = n, p", metavar = "" )
+  parser.add_argument( "-x", "--no_turn_off", action='store_true', help = "do not turn off the power supply at the end." )
+  parser.add_argument( "-y", "--no_turn_on", action='store_true', help = "do not control the HV power supply." )
+  parser.add_argument( "-z", "--turn_off", action='store_true', help = "turn off the high power supply and exit." )
+  parser.add_argument( "-o", "--offset_x", type = int, default = "0", help = "offsets x-position (in um) for z focusing." )
+  args = parser.parse_args()
+  if args.turn_off:
+    return args
+  if args.analyze_data and not args.bulk:
+    parser.error( "--analyze_data requires --bulk" )
+  if args.voltage and not args.bulk and not args.analyze_data and not args.go_to_position:
+    parser.error( "--voltage requires --bulk" )
+  if float( args.voltage  ) > 0 and args.bulk == "n":
+    parser.error( "n bulk requires negative voltage" )
+  if float( args.voltage  ) < 0 and args.bulk == "p":
+    parser.error( "p bulk requires positive voltage" )
+  if args.acquisition_mode == "average":
+    args.acquisition_number = 1
+  for ax in args.axis:
+    if ax not in [ "x", "y", "z" ]:
+      raise ValueError( "Humm... " + ax + " not standard axis. See help." )
+    if args.axis.count( "x" ) > 1:
+      for i in range( args.axis.count( "x" ) - 1 ):
+        args.axis.remove( "x" )
+    if args.axis.count( "y" ) > 1:
+      for i in range( args.axis.count( "y" ) - 1 ):
+        args.axis.remove( "y" )
+    if args.axis.count( "z" ) > 1:
+      for i in range( args.axis.count( "z" ) - 1 ):
+        args.axis.remove( "z" )
+  return args
+
+def main( args ):
+  time0 = time.time()
+  time1 = time0
+  factory = InterfaceFactory( "setupBrown.ini" )
+  scope = factory.getDevice( "scope" )
+  scope.write( "*CLS" )
+  keithley = factory.getDevice( "highVoltage" )
+#  agilent = factory.getDevice( "lowVoltage" )
+  if args.turn_off:
+    pW.turnOFFPowerSupply( keithley )
+    return
+  if args.go_to_position:
+    sensors = cF.getCoordFromFile()
+    s = stages.open_socket()
+    stages.sendtoCoordinates( s, sensors[ args.subparser ] )
+    stages.close_socket( s )
+    return
+  if args.analyze_data:
+    shutil.copyfile( "sensors.txt", "sensors_back.txt" )
+    for ax in args.axis:
+      xdata = []
+      ydata = []
+      for filename in [ fd for fd in args.files if fd.split( "_" )[ 2 ][ 0 ] == ax ]:
+        dirname = os.path.dirname( os.path.realpath( filename ) )
+        coordinate = filename.split( "_" )[ -1 ].replace( ".bin", "" )
+        print "coordinate:", coordinate
+        xdata.append( int( coordinate[ 1: ] ) )
+        ydata.append( processAndAnalysis( filename, args ) )
+      newCoordinate = plot( np.array( xdata ), np.array( ydata ), ax, dirname )
+      writeNewCoord( newCoordinate, args.subparser, ax )
+    return
+  else:
+    shutil.copyfile( "sensors.txt", "sensors_back.txt" )
+#    agilent.setChannel( "P25V" )
+#    pW.setPowerSupply( agilent, args.amp_voltage, args.amp_compliance )
+    if not args.no_turn_on:
+      pW.setPowerSupply( keithley, args.voltage, args.compliance )
+    confScope( scope, args.channel )
+    if args.acquisition_mode == "average":
+      scope.average( args.average_number )
+      scope.controlAcquisition( "AUTO" )
+      channel = scope.function
+    else:
+      scope.controlAcquisition( "SINGLE" )
+      channel = scope.channel
+    for ax in args.axis:
+      sensors = cF.getCoordFromFile()
+      s = stages.open_socket()
+      #Add offset to x-position if needed
+      sensors[ args.subparser ][0] += args.offset_x
+      stages.sendtoCoordinates( s, sensors[ args.subparser ] )
+      getElectronicNoiseSignal( s, sensors, args, scope, ax, channel )
+      stages.close_socket( s )
+      newCoordinate = findOptimumPosition( sensors, scope, args, ax, channel )
+      if newCoordinate != [ "out", "out", "out" ]:
+        writeNewCoord( newCoordinate, args.subparser, ax )
+      time2 = time.time()
+      print "Time for %s: %.2fs" % ( ax, time2 - time1 )
+      time1 = time2
+    if not args.no_turn_off:
+      pW.turnOFFPowerSupply( keithley )
+  print "Total time: %.2fs" % ( time.time() - time0 )
+
+
+if __name__ == "__main__":
+  args = parseador()
+  main( args )

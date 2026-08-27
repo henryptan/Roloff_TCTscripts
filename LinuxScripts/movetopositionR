@@ -1,0 +1,31 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+
+import argparse
+import stages
+
+
+def newCoordinates( coord, ax, distance ):
+  axis = [ "x", "y", "z" ]
+  indice = axis.index( ax )
+  newCoord = coord[ : ]
+  newCoord[ indice ] = str( int( newCoord[ indice ] ) + distance )
+  return newCoord
+
+def parseador():
+  parser = argparse.ArgumentParser( description = "Move the axis to the selected relative position." )
+  parser.add_argument( "-e", "--axis", type = str , default = "x", help = "select the axis", metavar = "" )
+  parser.add_argument( "-d", "--relative_distance", type = int , default = "100", help = "select the distance to move", metavar = "" )
+  args = parser.parse_args()
+  return args
+
+def main( ax, distance ):
+  s = stages.open_socket()
+  relCoord = stages.getRelativeCoordinates( s )
+  newCoord = newCoordinates( relCoord, ax, distance )
+  stages.sendtoCoordinates( s, newCoord )
+  stages.close_socket( s )
+
+if __name__ == "__main__":
+  args = parseador()
+  main( args.axis, args.relative_distance )

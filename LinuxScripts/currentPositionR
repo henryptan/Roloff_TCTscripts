@@ -1,0 +1,41 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+
+import argparse
+import stages
+import coordinatesFile as cF
+
+def writeNewCoord( detector, X, Y, Z ):
+  if detector == "Ref":
+    cF.changeRelCoordRefDiode( X, Y, Z )
+    return
+  sensors = cF.getCoordFromFile()
+  sensors = cF.changeCoordinate( sensors, detector, X, Y, Z )
+  print sensors
+  sensors = cF.setCoordHoldSyst( sensors )
+  print sensors
+  cF.writeCoord2File( sensors )
+
+def parseador():
+  parser = argparse.ArgumentParser( description = "Read laser current relative coordinates and write them to the coordinates file." )
+  parser.add_argument( "-s", "--sensor", type = str, choices=[ "First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Ref" ], help = "save the current coordinates sensor [ First, ..., Seventh, Ref ]", metavar = "" )
+  parser.add_argument( "-u", "--updateAbsPos", action="store_true", help = "sets Abs Pos in of RefDiode in sensors.txt" )
+  args = parser.parse_args()
+  print args
+  return args
+
+def main( sensor, updateAbsPos ):
+  s = stages.open_socket()
+  X, Y, Z = stages.getRelativeCoordinates( s )
+  print "X: %s, Y: %s, Z: %s" % ( X, Y, Z )
+  stages.close_socket( s )
+  if sensor:
+    writeNewCoord( sensor, X, Y, Z )
+
+  if (sensor == "Ref") and updateAbsPos:
+    origin = cF.readOriginPos()
+    cF.changeAbsCoordRefDiode( origin[0] + int(X), origin[1] + int(Y), origin[2] + int(Z) )
+
+if __name__ == "__main__":
+  args = parseador()
+  main( args.sensor, args.updateAbsPos )
