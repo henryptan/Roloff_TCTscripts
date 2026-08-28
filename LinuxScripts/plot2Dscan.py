@@ -24,6 +24,11 @@ if os.path.exists("channel_map.txt"):
                 continue
 
 unique_channels = df["Channel"].unique()
+
+#finding the min/max for the color axis
+vmin = df["Pairs"].min()
+vmax = df["Pairs"].max()
+
 fig, axes = plt.subplots(
     1, len(unique_channels), 
     figsize=(5.5 * len(unique_channels), 5), 
@@ -43,7 +48,9 @@ for idx, ch in enumerate(unique_channels):
             grid.columns.min(), grid.columns.max(),
             grid.index.min(), grid.index.max()
         ],
-        cmap="viridis"
+        cmap="viridis",
+        vmin = vmin,
+        vmax = vmax
     )
     
     ax.set_xlabel("x (um)")
