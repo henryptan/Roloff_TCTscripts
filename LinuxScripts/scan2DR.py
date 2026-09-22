@@ -64,9 +64,10 @@ def findOptimumPosition( sensors, scope, args, target_channels ):
   rangoX = range( rangesteps[ "x" ][ 0 ], rangesteps[ "x" ][ 1 ], rangesteps[ "x" ][ 2 ] )
   rangoY = range( rangesteps[ "y" ][ 0 ], rangesteps[ "y" ][ 1 ], rangesteps[ "y" ][ 2 ] )
   s = stages.open_socket()
-
+  flip = 1 #flips the y-coordinate so the scan does not have to go back to the beginning when doing a 2D scan
+  
   for i in rangoX:
-    for j in rangoY:
+    for j in rangoY[::flip]:
       coordinates = center[ : ]
       coordinates[ 0 ] += i
       coordinates[ 1 ] += j
@@ -84,7 +85,7 @@ def findOptimumPosition( sensors, scope, args, target_channels ):
           str( center[ axes.index( "y" ) ] + j )
         )
         acquireData( scope, args.acquisition_number, args.average_number, filename, target_ch )
-
+    flip = flip*-1
   stages.close_socket( s )
 
 def parseador():
