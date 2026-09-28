@@ -52,6 +52,11 @@ for idx, ch in enumerate(unique_channels):
         vmin = vmin,
         vmax = vmax
     )
+
+    #reflects both axes to show the correct orientation. Note that the x-axis must be flipped, however the y-axis only needs to be flipped if the y-coordinates
+    #are negative.
+    ax.invert_xaxis()
+    ax.invert_yaxis()
     
     ax.set_xlabel("x (um)")
     ax.set_ylabel("y (um)")
