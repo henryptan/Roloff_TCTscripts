@@ -40,7 +40,7 @@ def getCharge( dataTCT ):
   max_gain = 53
   rel_gain = { 6 : 0.15, 7 : 0.4, 8 : 0.6, 9 : 0.8, 10 : 0.9, 11 : 1, 12 : 1, 13 : 1, 14 : 1, 15 : 1 }
   gain = max_gain * rel_gain[ voltage ]
-  charge = sum( dataTCT.cuttedData ) * dataTCT.header[ "xincr" ] / ( 50 * gain )
+  charge = sum( dataTCT.cuttedPeak ) * dataTCT.header[ "xincr" ] / ( 50 * gain )
   return abs( charge )
 
 def convertAndShiftData( dataTCT ):
@@ -67,16 +67,27 @@ def averageTheData( dataTCT ):
     average += np.array( wave )
   average /= float( len( dataTCT.noiselessData ) )
   dataTCT.averageData = list( average )
+  
+def windowed( data, init, end ):
+  """Copy of data with everything outside [init:end] set to 0."""
+  return init * [ 0 ] + data[ init : end ] + ( len( data ) - end ) * [ 0 ]
 
-def cutData( dataTCT, cut = "signal" ):
-  """ Function that looks for the minimum in the signal and it cuts a 50ns window.
-      The window has to begin 1ns before the beginning of the signal and extends
-      for 50ns.
-      If the argument cut is equal to peak the cut will take only the peak, not 50ns
+def cutData( dataTCT, plotCut = "signal" ):
+  """ Defines two independent windows on the averaged waveform:
+      - Charge window (always "peak"): only the negative lobe, from the zero-crossing
+        before the minimum to the first zero-crossing after it. Stored in
+        cuttedPeak and used ONLY by getCharge. The positive overshoot is not included.
+      - Plot window (plotCut): used ONLY for plotting.
+          signal : 50ns window starting 1ns before the pulse
+          peak   : same as the charge window
+          whole  : entire waveform
+        Stored in cuttedData, initPoint and endPoint.
   """
   window = [ -1e-9, 49e-9 ]
   minimum = dataTCT.averageData.index( min( dataTCT.averageData ) )
-  for k in range( len( dataTCT.averageData[ : minimum + 1 ] ) - 1, -1, -1 ):
+  dataTCT.initSignal = 0
+  dataTCT.endSignal = len( dataTCT.averageData )
+  for k in range( minimum, -1, -1 ):
     if dataTCT.averageData[ k ] > 0.0:
       dataTCT.initSignal = k
       break
@@ -85,16 +96,23 @@ def cutData( dataTCT, cut = "signal" ):
       dataTCT.endSignal = k
       break
   dataTCT.calculateWindow( window )
-  if cut == "peak":
-    dataTCT.initPoint = dataTCT.initSignal
-    dataTCT.endPoint = dataTCT.endSignal
-  elif cut == "signal":
+
+  # Charge window: always the negative lobe
+  dataTCT.initPeak = dataTCT.initSignal
+  dataTCT.endPeak = dataTCT.endSignal
+  dataTCT.cuttedPeak = windowed( dataTCT.averageData, dataTCT.initPeak, dataTCT.endPeak )
+
+  # Plot window: selected by plotCut
+  if plotCut == "peak":
+    dataTCT.initPoint = dataTCT.initPeak
+    dataTCT.endPoint = dataTCT.endPeak
+  elif plotCut == "signal":
     dataTCT.initPoint = dataTCT.initWindow
     dataTCT.endPoint = dataTCT.endWindow
-  elif cut == "whole":
+  elif plotCut == "whole":
     dataTCT.initPoint = 0
-    dataTCT.endPoint = len( dataTCT.average)
-  dataTCT.cuttedData = dataTCT.initPoint * [ 0 ] + dataTCT.averageData[ dataTCT.initPoint : dataTCT.endPoint ] + ( len( dataTCT.averageData ) - dataTCT.endPoint ) * [ 0 ]
+    dataTCT.endPoint = len( dataTCT.averageData )
+  dataTCT.cuttedData = windowed( dataTCT.averageData, dataTCT.initPoint, dataTCT.endPoint )
 
 def pedestal( data ):
   """It calculates the pedestal to eliminate any possible DC in the measure.
@@ -136,15 +154,17 @@ def plotAnalysis( dataTCT ):
   pylab.xlabel( "Time(s)" )
   pylab.ylabel( "Voltage(V)" )
   fig.add_subplot( 223 )
-  pylab.plot( dataTCT.xdata[ dataTCT.initPoint : dataTCT.endPoint ], dataTCT.averageData[ dataTCT.initPoint : dataTCT.endPoint ], "k", label = "50ns window" )
+  pylab.plot( dataTCT.xdata[ dataTCT.initPoint : dataTCT.endPoint ], dataTCT.averageData[ dataTCT.initPoint : dataTCT.endPoint ], "k", label = "Plot window" )
+  pylab.axvspan( dataTCT.xdata[ dataTCT.initPeak ], dataTCT.xdata[ dataTCT.endPeak - 1 ], color = "b", alpha = 0.2, label = "Charge window" )
   pylab.ticklabel_format( axis = 'both', style = 'sci', scilimits = ( 0, 0 ) )
   pylab.legend( loc = 0 )
   pylab.grid( True )
-  pylab.legend( loc = 0 )
   pylab.xlabel( "Time(s)" )
   pylab.ylabel( "Voltage(V)" )
   fig.add_subplot( 224 )
-  pylab.plot( dataTCT.xdata[ dataTCT.initPoint - 100 : dataTCT.endPoint + 100  ], dataTCT.cuttedData[ dataTCT.initPoint - 100 : dataTCT.endPoint + 100 ], "k", label = "Integrating\nwindow" )
+  lo = max( 0, dataTCT.initPoint - 100 )
+  hi = dataTCT.endPoint + 100
+  pylab.plot( dataTCT.xdata[ lo : hi ], dataTCT.cuttedData[ lo : hi ], "k", label = "Plot window\n(display only)" )
   pylab.ticklabel_format( axis = 'both', style = 'sci', scilimits = ( 0, 0 ) )
   pylab.legend( loc = 0 )
   pylab.grid( True )
@@ -154,13 +174,14 @@ def plotAnalysis( dataTCT ):
   pylab.savefig( dataTCT.filename.replace( ".bin", ".png" ) )
   pylab.close()
 
-def processData( dataTCT, noiseTCT, verbosity, cut = "signal" ):
-  """Different steps to finally get the charge from the waveforms
+def processData( dataTCT, noiseTCT, verbosity, plotCut = "signal" ):
+  """Different steps to finally get the charge from the waveforms.
+     The charge always uses the negative-lobe window; plotCut only affects the plots.
   """
   convertAndShiftData( dataTCT )
   removeElectronicNoise( dataTCT, noiseTCT )
   averageTheData( dataTCT )
-  cutData( dataTCT, cut )
+  cutData( dataTCT, plotCut )
   charge = getCharge( dataTCT )
   if verbosity:
     plotAnalysis( dataTCT )
@@ -182,7 +203,7 @@ def parseador():
   parser.add_argument( "-f", "--files", type = str, nargs = "+", help = "binary data files" )
   parser.add_argument( "-n", "--noise_file", type = str, help = "electronic noise file" )
   parser.add_argument( "-b", "--bulk", type = str, choices = [ "p", "n" ], default = "n", help = "bulk of the sensor. Choices = n, p. Default = %(default)s", metavar = "" )
-  parser.add_argument( "-i", "--integration_window", type = str, choices = [ "signal", "peak", "whole" ], default = "signal", help = "definiton of the integration window, 50ns since the beginning of the peak or only the peak. Choices = signal, peak. Default = %(default)s", metavar = "" )
+  parser.add_argument( "-i", "--integration_window", type = str, choices = [ "signal", "peak", "whole" ], default = "signal", help = "window shown in the plots (the charge always uses the negative lobe only). signal = 50ns window starting 1ns before the pulse, peak = negative lobe only, whole = entire waveform. Default = %(default)s", metavar = "" )
   parser.add_argument( "-v", "--verbosity", type = int, required = False, default = 1, help = "Verbosity, plots for individual scans are produced only when the verbosity is on. Choices = 0, 1", metavar = "" )
   args = parser.parse_args()
   return args
@@ -231,7 +252,7 @@ def main( files, noiseFile, bulk, integrationWindow, verbosity ):
     dataTCT[ -1 ].bulk = bulk
     voltage = [ value for value in dataTCT[ -1 ].filename.split( "_" ) if value[ 0 ] == "V" and value[ -1 ] == "V" ][ 0 ].replace( "V", "" )
     getData( dataTCT[ -1 ] )
-    charge = processData( dataTCT[ -1 ], noiseTCT, verbosity )
+    charge = processData( dataTCT[ -1 ], noiseTCT, verbosity, integrationWindow )
     pairs, mips = strmResults( charge )
     if (verbosity or count % 100 == 0):
       print "File: %s" % dataTCT[ -1 ].filename
